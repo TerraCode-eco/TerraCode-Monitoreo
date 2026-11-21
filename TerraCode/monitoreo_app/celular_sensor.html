@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sensor ODS 15</title>
+<style>
+  :root { --bg:#0f172a; --panel:#1e293b; --txt:#f8fafc; --sub:#94a3b8; --verde:#10b981; --rojo:#ef4444; --amar:#f59e0b; --azul:#2563eb; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; padding:16px; }
+  h1 { font-size:20px; margin:4px 0 2px; }
+  .sub { color:var(--sub); font-size:13px; margin-bottom:14px; }
+  .card { background:var(--panel); border-radius:14px; padding:14px; margin-bottom:12px; }
+  label { display:block; font-size:13px; color:var(--sub); margin:8px 0 4px; }
+  input, select { width:100%; padding:12px; font-size:18px; border-radius:10px; border:1px solid #334155; background:var(--bg); color:var(--txt); }
+  input.codigo { letter-spacing:8px; text-align:center; font-size:26px; }
+  button { width:100%; padding:16px; font-size:18px; font-weight:700; border:0; border-radius:12px; color:#fff; background:var(--azul); margin-top:12px; }
+  button.verde { background:var(--verde); } button.rojo { background:var(--rojo); } button.gris { background:#475569; font-size:14px; padding:10px; }
+  .fila { display:flex; gap:8px; align-items:center; } .fila > * { flex:1; }
+  .medidor { height:14px; background:#0b1220; border-radius:7px; overflow:hidden; margin-top:8px; }
+  .medidor > div { height:100%; width:0; background:linear-gradient(90deg,var(--verde),var(--amar),var(--rojo)); transition:width .1s; }
+  .estado { font-size:14px; color:var(--sub); margin-top:8px; min-height:20px; }
+  .resultado { font-size:22px; font-weight:800; margin-top:4px; }
+  .amenaza { color:var(--rojo); } .normal { color:var(--verde); } .pausa { color:var(--amar); }
+  ul { list-style:none; padding:0; margin:6px 0 0; font-size:14px; } li { padding:6px 0; border-bottom:1px solid #334155; }
+  .oculto { display:none; }
+  small { color:var(--sub); }
+</style>
+</head>
+<body>
+<h1>🎙 Sensor acústico ODS 15</h1>
+<div class="sub">Este celular escucha el bosque y envía el audio al sistema de monitoreo.</div>
+
+<div id="pantallaEmparejar" class="card oculto">
+  <b>Conectar este celular</b>
+  <label>Código de 6 dígitos que muestra el programa (botón «📱 Conectar celular»)</label>
+  <input id="codigo" class="codigo" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="000000">
+  <button id="btnEmparejar">Conectar</button>
+  <div id="estadoEmp" class="estado"></div>
+</div>
+
+<div id="pantallaSensor" class="oculto">
+  <div class="card">
+    <div class="fila"><div>Sensor: <b id="nomSensor"></b></div><button class="gris" id="btnOlvidar" style="flex:0 0 auto;width:auto;margin:0">Cambiar</button></div>
+    <label>Enviar audio cada</label>
+    <select id="trozo"><option value="3">3 segundos</option><option value="5" selected>5 segundos</option><option value="10">10 segundos</option></select>
+    <label><input type="checkbox" id="usarGps" checked style="width:auto"> Enviar mi ubicación GPS (la alerta mostrará dónde está este celular)</label>
+    <button id="btnIniciar" class="verde">▶ Empezar a escuchar</button>
+    <div class="medidor"><div id="nivel"></div></div>
+    <div id="estado" class="estado">Listo.</div>
+    <div id="aviso" class="estado pausa"></div>
+    <button id="btnRecargar" class="gris oculto" onclick="location.reload()">🔄 Recargar la página</button>
+    <div id="modo" class="estado"></div>
+  </div>
+  <div class="card">
+    <small>Último análisis del sistema</small>
+    <div id="ultimo" class="resultado">—</div>
+    <div id="detalle" class="estado"></div>
+    <ul id="historial"></ul>
+  </div>
+  <div class="card"><small>Para que no se corte: deja la pantalla encendida y esta página abierta, y conecta el cargador.
+    Celular y computador deben estar en la misma red Wi-Fi (o el computador conectado al punto de acceso del celular).</small></div>
+</div>
+
+<script>
+const SR = 16000;
+const VERSION_PAGINA = "__VERSION_PAGINA__";      // la pone el programa al enviar la página
+const $ = (id) => document.getElementById(id);
+let cred = null, ctx = null, stream = null, proc = null, fuente = null;
+let partes = [], muestras = 0, srEntrada = 48000, temporizador = null, activo = false;
+let pendientes = [], enviados = 0, wakeLock = null, ubicacion = null, idGps = null;
+// «Enviar solo cuando haya sonido» (lo activa el administrador en el programa)
+let cfgSonido = { solo_con_sonido: false, umbral_db: 10, latido_s: 120, sensibilidad: "media" };
+let piso = null, extra = 0, ultimoEnvio = 0, omitidos = 0, omitidosTotal = 0, temporizadorCfg = null;
+
+function pintarModo() {
+  $("modo").textContent = cfgSonido.solo_con_sonido
+    ? `🔇 Modo: enviar solo cuando haya sonido (sensibilidad ${cfgSonido.sensibilidad}) · ${omitidosTotal} trozo(s) en silencio sin enviar`
+    : "📶 Modo: envío continuo";
+}
+function olvidarSensor(mensaje) {
+  if (activo) detener();
+  try { localStorage.removeItem("sensor_ods15"); } catch (e) {}
+  cred = null; mostrar();
+  $("estadoEmp").textContent = mensaje;
+}
+function revisarVersion(v) {
+  if (!v || VERSION_PAGINA.startsWith("__") || v === VERSION_PAGINA) return;
+  if (!activo) { location.reload(); return; }          // hay una versión nueva de la página: se actualiza sola
+  $("aviso").textContent = "Hay una versión nueva de esta página. Detén la escucha y recarga para usarla.";
+  $("btnRecargar").classList.remove("oculto");
+}
+async function leerConfig() {
+  if (!cred) return true;
+  try {
+    const r = await fetch("/config", { headers: { "X-Sensor-Id": cred.sensor_id, "X-Sensor-Token": cred.token } });
+    if (r.status === 401) {
+      olvidarSensor("El programa ya no reconoce este celular (se reinstaló, se borró el sensor o cambió el token). "
+                    + "Pulsa «Conectar celular» en el programa y escribe el código nuevo.");
+      return false;
+    }
+    if (r.ok) { cfgSonido = await r.json(); pintarModo(); revisarVersion(cfgSonido.version_pagina); }
+    $("btnRecargar").classList.add("oculto");
+    return true;
+  } catch (e) {
+    sinConexion();
+    return false;
+  }
+}
+function sinConexion() {
+  $("estado").textContent = `⚠ Sin conexión con el programa${pendientes.length ? ` (${pendientes.length} trozo(s) en espera)` : ""}.`;
+  $("aviso").textContent = "Revisa: 1) que el programa esté abierto y diga «📡 Sensores: ON»; 2) que el celular y el computador "
+    + "sigan en la misma red; 3) si reiniciaste el computador o cambiaste de red, vuelve a abrir la dirección que muestra "
+    + "«Conectar celular» (puede haber cambiado) y acepta el aviso de seguridad.";
+  $("btnRecargar").classList.remove("oculto");
+}
+function debeEnviar(y) {
+  // Nivel del trozo (RMS) y del momento más fuerte (ventanas de 50 ms): un disparo es corto pero muy fuerte.
+  let s = 0; for (let i = 0; i < y.length; i++) s += y[i] * y[i];
+  const rmsDb = 10 * Math.log10(s / y.length + 1e-12);
+  let maxDb = -120; const v = Math.round(SR * 0.05);
+  for (let i = 0; i + v <= y.length; i += v) {
+    let e = 0; for (let j = i; j < i + v; j++) e += y[j] * y[j];
+    maxDb = Math.max(maxDb, 10 * Math.log10(e / v + 1e-12));
+  }
+  if (!cfgSonido.solo_con_sonido) return { enviar: true, motivo: "" };
+  if (piso === null) { piso = rmsDb; return { enviar: true, motivo: "primer trozo" }; }
+  const u = cfgSonido.umbral_db;
+  const activo = maxDb > piso + u || rmsDb > piso + u * 0.6;
+  // El ruido de fondo se aprende de los trozos tranquilos; durante un sonido largo (una motosierra) sube muy despacio
+  // para no "acostumbrarse" a él y dejar de enviarlo.
+  if (activo) piso = Math.min(piso + 0.1, rmsDb); else piso = 0.85 * piso + 0.15 * rmsDb;
+  if (activo) { extra = 1; return { enviar: true, motivo: "sonido" }; }
+  if (extra > 0) { extra--; return { enviar: true, motivo: "continuación" }; }
+  if (Date.now() - ultimoEnvio > cfgSonido.latido_s * 1000) return { enviar: true, motivo: "latido" };
+  return { enviar: false, motivo: "silencio" };
+}
+
+function guardarCred(c) { cred = c; try { localStorage.setItem("sensor_ods15", JSON.stringify(c)); } catch (e) {} }
+function cargarCred() { try { return JSON.parse(localStorage.getItem("sensor_ods15") || "null"); } catch (e) { return null; } }
+function mostrar() {
+  $("pantallaEmparejar").classList.toggle("oculto", !!cred);
+  $("pantallaSensor").classList.toggle("oculto", !cred);
+  if (cred) $("nomSensor").textContent = `${cred.nombre || cred.sensor_id} (${cred.sensor_id})`;
+}
+
+$("btnEmparejar").onclick = async () => {
+  const codigo = $("codigo").value.trim();
+  $("estadoEmp").textContent = "Conectando...";
+  try {
+    const r = await fetch("/emparejar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ codigo }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+    guardarCred(d); mostrar();
+  } catch (e) { $("estadoEmp").textContent = "✗ " + e.message; }
+};
+$("btnOlvidar").onclick = () => { if (activo) detener(); try { localStorage.removeItem("sensor_ods15"); } catch (e) {} cred = null; mostrar(); };
+$("btnIniciar").onclick = () => activo ? detener() : iniciar();
+
+async function iniciar() {
+  $("estado").textContent = "Comprobando la conexión con el programa...";
+  if (!(await leerConfig())) return;                    // sin conexión o sensor desconocido: se explica y no se empieza
+  try {
+    // Sin cancelación de eco, supresión de ruido ni ganancia automática: el teléfono las usa para la voz y
+    // borrarían justamente los sonidos que buscamos (motor de una motosierra, ruido de fondo, impulsos).
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+  } catch (e) {
+    $("estado").textContent = "✗ No se pudo usar el micrófono: " + e.message + (location.protocol !== "https:" ? " (abre la página con https://)" : "");
+    return;
+  }
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  srEntrada = ctx.sampleRate;
+  fuente = ctx.createMediaStreamSource(stream);
+  proc = ctx.createScriptProcessor(4096, 1, 1);
+  proc.onaudioprocess = (ev) => {
+    const d = ev.inputBuffer.getChannelData(0);
+    partes.push(new Float32Array(d)); muestras += d.length;
+    let s = 0; for (let i = 0; i < d.length; i += 4) s += d[i] * d[i];
+    const db = 10 * Math.log10(s / (d.length / 4) + 1e-12);
+    $("nivel").style.width = Math.max(0, Math.min(100, (db + 70) * 1.6)) + "%";
+  };
+  fuente.connect(proc); proc.connect(ctx.destination);
+  activo = true; partes = []; muestras = 0; piso = null; extra = 0; ultimoEnvio = 0;
+  leerConfig(); temporizadorCfg = setInterval(leerConfig, 20000);   // el cambio en Administración llega en ~20 s
+  temporizador = setInterval(cortar, Number($("trozo").value) * 1000);
+  $("btnIniciar").textContent = "■ Detener"; $("btnIniciar").className = "rojo";
+  $("estado").textContent = "🎙 Escuchando...";
+  if ($("usarGps").checked && navigator.geolocation)
+    idGps = navigator.geolocation.watchPosition((p) => { ubicacion = p.coords; }, () => {}, { enableHighAccuracy: true });
+  pedirPantalla();
+}
+
+function detener() {
+  activo = false; clearInterval(temporizador); clearInterval(temporizadorCfg);
+  try { proc.disconnect(); fuente.disconnect(); ctx.close(); stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+  if (idGps !== null) navigator.geolocation.clearWatch(idGps);
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  $("btnIniciar").textContent = "▶ Empezar a escuchar"; $("btnIniciar").className = "verde";
+  $("estado").textContent = `Detenido. ${enviados} trozo(s) enviados.`; $("nivel").style.width = "0";
+}
+
+async function pedirPantalla() { try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {} }
+document.addEventListener("visibilitychange", () => { if (activo && document.visibilityState === "visible") pedirPantalla(); });
+
+function cortar() {
+  if (!muestras) return;
+  const x = new Float32Array(muestras); let o = 0;
+  for (const p of partes) { x.set(p, o); o += p.length; }
+  // Traslape de 1 s: el final de este trozo se repite al inicio del siguiente, para que un disparo que cae justo
+  // en el corte llegue completo en al menos uno de los dos.
+  const solape = Math.min(x.length, Math.round(srEntrada * 1.0));
+  partes = [x.slice(x.length - solape)]; muestras = solape;
+  let pico = 0; for (let i = 0; i < x.length; i++) { const a = Math.abs(x[i]); if (a > pico) pico = a; }
+  const picoDb = 20 * Math.log10(pico + 1e-9);
+  $("aviso").textContent = picoDb < -40 ? `⚠ Nivel muy bajo (${picoDb.toFixed(0)} dB): acerca el celular a la fuente o sube el volumen del parlante.`
+                         : picoDb > -1 ? "⚠ El sonido satura el micrófono: aleja un poco el celular." : "";
+  // Remuestreo a 16 kHz promediando (filtro anti-aliasing simple)
+  const r = srEntrada / SR, n = Math.floor(x.length / r), y = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const a = Math.floor(i * r), b = Math.max(a + 1, Math.floor((i + 1) * r)); let s = 0;
+    for (let j = a; j < b && j < x.length; j++) s += x[j];
+    y[i] = s / (b - a);
+  }
+  const dec = debeEnviar(y);
+  if (!dec.enviar) {
+    omitidos++; omitidosTotal++; pintarModo();
+    if (!pendientes.length) $("estado").textContent = `🔇 Silencio: no se envía (${omitidosTotal} trozo(s) ahorrados)`;
+    return;
+  }
+  ultimoEnvio = Date.now();
+  pendientes.push({ wav: aWav(y), nombre: `${cred.sensor_id}_${Date.now()}.wav`, omitidos });
+  omitidos = 0;
+  if (pendientes.length > 20) pendientes.shift();       // sin red: se guardan los últimos 20 trozos
+  vaciarCola();
+}
+
+function aWav(y) {
+  const v = new DataView(new ArrayBuffer(44 + y.length * 2));
+  const txt = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  txt(0, "RIFF"); v.setUint32(4, 36 + y.length * 2, true); txt(8, "WAVE"); txt(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, SR, true);
+  v.setUint32(28, SR * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); txt(36, "data"); v.setUint32(40, y.length * 2, true);
+  for (let i = 0; i < y.length; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, y[i])) * 32767, true);
+  return new Blob([v], { type: "audio/wav" });
+}
+
+let enviando = false;
+async function vaciarCola() {
+  if (enviando) return; enviando = true;
+  while (pendientes.length) {
+    const t = pendientes[0];
+    const cab = { "X-Sensor-Id": cred.sensor_id, "X-Sensor-Token": cred.token, "X-Filename": t.nombre, "Content-Type": "audio/wav" };
+    if (ubicacion) { cab["X-Lat"] = ubicacion.latitude.toFixed(6); cab["X-Lon"] = ubicacion.longitude.toFixed(6); }
+    if (t.omitidos) cab["X-Omitidos"] = String(t.omitidos);
+    try {
+      const r = await fetch("/audio", { method: "POST", headers: cab, body: t.wav });
+      const d = await r.json().catch(() => ({}));
+      if (r.status === 401) { olvidarSensor("El programa rechazó este celular. Escribe un código nuevo («Conectar celular»)."); break; }
+      if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+      pendientes.shift(); enviados++;
+      if (d.config) { cfgSonido = d.config; pintarModo(); revisarVersion(d.config.version_pagina); }
+      $("aviso").textContent = ""; $("btnRecargar").classList.add("oculto");
+      if (d.analizado === false) {
+        $("estado").textContent = `🎙 Escuchando... ${enviados} enviados`;
+        anotar(`⏸ Recibido sin analizar: ${d.motivo}`, "pausa");
+      } else {
+        $("estado").textContent = `🎙 Escuchando... ${enviados} enviados${ubicacion ? " · GPS ✓" : ""}`;
+        if (d.audio_id) seguirResultado(d.audio_id);
+      }
+    } catch (e) {
+      sinConexion();
+      break;
+    }
+  }
+  enviando = false;
+}
+
+async function seguirResultado(audioId) {
+  for (let i = 0; i < 15; i++) {
+    await new Promise((ok) => setTimeout(ok, 1000));
+    try {
+      const r = await fetch(`/resultado?audio_id=${audioId}`, { headers: { "X-Sensor-Id": cred.sensor_id, "X-Sensor-Token": cred.token } });
+      const d = await r.json();
+      if (d.categoria) {
+        const amen = d.alerta;
+        const txt = `${amen ? "🚨 " : ""}${d.categoria.replace("_", " ").toUpperCase()} ${Math.round(d.confianza * 100)}%`;
+        anotar(txt, amen ? "amenaza" : "normal", d.justificacion);
+        if (amen && navigator.vibrate) navigator.vibrate([300, 150, 300]);
+        return;
+      }
+      if (d.estado === "error") { anotar("✗ El sistema no pudo analizar el trozo", "pausa"); return; }
+    } catch (e) {}
+  }
+}
+
+function anotar(texto, clase, detalle) {
+  $("ultimo").textContent = texto; $("ultimo").className = "resultado " + clase;
+  $("detalle").textContent = detalle || "";
+  const li = document.createElement("li");
+  li.innerHTML = `<span class="${clase}">${texto}</span> <small>${new Date().toLocaleTimeString()}</small>`;
+  $("historial").prepend(li);
+  while ($("historial").children.length > 8) $("historial").lastChild.remove();
+}
+
+cred = cargarCred(); mostrar(); leerConfig(); pintarModo();
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+numpy
+scipy
+requests
+cryptography
+# Opcional (solo si un sensor de PC usa micrófono con sensor_cliente.py): sounddevice
